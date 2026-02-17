@@ -1,0 +1,26 @@
+[package]
+name = "leakd"
+version = "0.4.0"
+edition = "2021"
+description = "Fast file server with uploads, tunnels, and TLS"
+license = "MIT"
+repository = "https://github.com/cybrly/leak"
+keywords = ["file-server", "http", "upload", "tunnel", "tls"]
+categories = ["command-line-utilities", "web-programming::http-server"]
+
+[[bin]]
+name = "leak"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio", "server-auto", "http1"] }
+http-body-util = "0.1"
+bytes = "1"
+base64 = "0.22"
+tokio-rustls = "0.26"
+rustls = "0.23"
+rustls-pemfile = "2"
+rcgen = "0.13"
+qrcode = "0.14"
