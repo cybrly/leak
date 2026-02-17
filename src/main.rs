@@ -18,6 +18,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
 use tokio::process::Command;
 use tokio::signal;
+use zip::write::SimpleFileOptions;
 
 // ── ANSI codes ────────────────────────────────────────────────────────
 
@@ -250,6 +251,25 @@ fn extract_json_string(json: &str, key: &str) -> Option<String> {
     Some(json[start..end].to_string())
 }
 
+// ── Simple JSON array extraction ──────────────────────────────────────
+
+fn extract_json_string_array(json: &str, key: &str) -> Vec<String> {
+    let pattern = format!("\"{}\"", key);
+    let key_pos = match json.find(&pattern) { Some(p) => p, None => return vec![] };
+    let after_key = &json[key_pos + pattern.len()..];
+    // Find the opening bracket
+    let bracket_pos = match after_key.find('[') { Some(p) => p, None => return vec![] };
+    let after_bracket = &after_key[bracket_pos + 1..];
+    let close_pos = match after_bracket.find(']') { Some(p) => p, None => return vec![] };
+    let array_content = &after_bracket[..close_pos];
+    array_content.split(',')
+        .filter_map(|s| {
+            let trimmed = s.trim().trim_matches('"');
+            if trimmed.is_empty() { None } else { Some(trimmed.to_string()) }
+        })
+        .collect()
+}
+
 // ── CSS ───────────────────────────────────────────────────────────────
 
 const PAGE_CSS: &str = r##"
@@ -355,6 +375,32 @@ thead th {
 .upload-status.error { color:var(--red); }
 .upload-status.success { color:var(--green); }
 .no-results { display:none; padding:32px; text-align:center; color:var(--text-dim); font-size:14px; }
+.cb { width:32px; text-align:center; padding-right:0 !important; }
+.cb input[type="checkbox"] {
+    width:15px; height:15px; cursor:pointer; accent-color:var(--accent);
+    vertical-align:middle; margin:0;
+}
+thead .cb { vertical-align:middle; }
+.sel-bar {
+    position:fixed; bottom:0; left:0; right:0;
+    background:var(--surface); border-top:1px solid var(--border);
+    padding:12px 32px; display:none; align-items:center; justify-content:center; gap:16px;
+    z-index:100; box-shadow:0 -4px 12px rgba(0,0,0,0.2);
+    animation:slideUp 0.2s ease-out;
+}
+@keyframes slideUp { from{transform:translateY(100%)} to{transform:translateY(0)} }
+.sel-bar.visible { display:flex; }
+.sel-count { font-size:14px; color:var(--text); font-weight:500; }
+.sel-btn {
+    background:var(--accent); color:#fff; border:none; border-radius:6px;
+    padding:8px 20px; font-size:14px; font-weight:600; cursor:pointer;
+    transition:opacity 0.15s; font-family:inherit;
+}
+.sel-btn:hover { opacity:0.85; }
+.sel-btn.sel-clear {
+    background:none; border:1px solid var(--border); color:var(--text-dim);
+}
+.sel-btn.sel-clear:hover { border-color:var(--accent); color:var(--text); }
 @media (max-width:640px) {
     .header{padding:12px 16px} .container{padding:12px 16px 32px}
     .modified{display:none} .header-inner{flex-direction:column;align-items:flex-start;gap:8px}
@@ -395,7 +441,7 @@ async fn render_directory(dir_path: &Path, uri_path: &str, root: &Path) -> Strin
             match t.rfind('/') { Some(0) => "/".into(), Some(p) => t[..p].into(), None => "/".into() }
         } else { "/".to_string() };
         rows.push_str(&format!(
-            r#"<tr class="entry" data-name=".." onclick="window.location='{parent}'"><td class="icon">📁</td><td class="name"><a href="{parent}">..</a></td><td class="size dim">&mdash;</td><td class="modified dim">&mdash;</td></tr>"#,
+            r#"<tr class="entry" data-name=".." onclick="window.location='{parent}'"><td class="cb"></td><td class="icon">📁</td><td class="name"><a href="{parent}">..</a></td><td class="size dim">&mdash;</td><td class="modified dim">&mdash;</td></tr>"#,
         ));
     }
 
@@ -410,7 +456,7 @@ async fn render_directory(dir_path: &Path, uri_path: &str, root: &Path) -> Strin
         let esc = html_escape(name);
         let suf = if *is_dir { "/" } else { "" };
         rows.push_str(&format!(
-            r#"<tr class="entry" data-name="{}" onclick="window.location='{href_s}'"><td class="icon">{icon}</td><td class="{nc}"><a href="{href_s}">{esc}{suf}</a></td><td class="size">{sz}</td><td class="modified">{mt}</td></tr>"#,
+            r#"<tr class="entry" data-name="{}" data-href="{href_s}" onclick="rowClick(event,this)"><td class="cb"><input type="checkbox" class="sel-cb" data-path="{href_s}" onclick="event.stopPropagation();updateSelection()"></td><td class="icon">{icon}</td><td class="{nc}"><a href="{href_s}">{esc}{suf}</a></td><td class="size">{sz}</td><td class="modified">{mt}</td></tr>"#,
             html_escape(&name.to_lowercase()),
         ));
     }
@@ -421,6 +467,8 @@ async fn render_directory(dir_path: &Path, uri_path: &str, root: &Path) -> Strin
 
     let upload_target = if uri_path.ends_with('/') { format!("{uri_path}__upload") }
                         else { format!("{uri_path}/__upload") };
+    let download_target = if uri_path.ends_with('/') { format!("{uri_path}__download") }
+                          else { format!("{uri_path}/__download") };
 
     format!(
         r##"<!DOCTYPE html><html lang="en"><head>
@@ -453,10 +501,15 @@ async fn render_directory(dir_path: &Path, uri_path: &str, root: &Path) -> Strin
     <span>{fc} file{}</span>
     <span>{}</span>
   </div>
-  <table><thead><tr><th></th><th>Name</th><th style="text-align:right">Size</th><th style="text-align:right">Modified</th></tr></thead>
+  <table><thead><tr><th class="cb"><input type="checkbox" id="selectAll" title="Select all"></th><th></th><th>Name</th><th style="text-align:right">Size</th><th style="text-align:right">Modified</th></tr></thead>
   <tbody id="fileList">{rows}</tbody></table>
   <div class="no-results" id="noResults">No files match your search</div>
   {}
+</div>
+<div class="sel-bar" id="selBar">
+  <span class="sel-count" id="selCount">0 selected</span>
+  <button class="sel-btn" id="selDownload">Download</button>
+  <button class="sel-btn sel-clear" id="selClear">Clear</button>
 </div>
 <script>
 // Theme toggle
@@ -494,6 +547,69 @@ document.addEventListener('keydown', (e) => {{
     e.preventDefault();
     searchBar.focus();
   }}
+}});
+
+// Selection
+const selBar = document.getElementById('selBar');
+const selCount = document.getElementById('selCount');
+const selDownload = document.getElementById('selDownload');
+const selClear = document.getElementById('selClear');
+const selectAll = document.getElementById('selectAll');
+
+function getCheckboxes() {{ return document.querySelectorAll('.sel-cb'); }}
+
+function updateSelection() {{
+  const cbs = getCheckboxes();
+  const checked = document.querySelectorAll('.sel-cb:checked');
+  const n = checked.length;
+  if (n > 0) {{
+    selBar.classList.add('visible');
+    selCount.textContent = n + ' selected';
+  }} else {{
+    selBar.classList.remove('visible');
+  }}
+  selectAll.checked = cbs.length > 0 && checked.length === cbs.length;
+  selectAll.indeterminate = checked.length > 0 && checked.length < cbs.length;
+}}
+
+function rowClick(e, row) {{
+  if (e.target.tagName === 'A' || e.target.tagName === 'INPUT') return;
+  const cb = row.querySelector('.sel-cb');
+  if (cb) {{ cb.checked = !cb.checked; updateSelection(); }}
+}}
+
+selectAll.addEventListener('change', () => {{
+  const state = selectAll.checked;
+  getCheckboxes().forEach(cb => {{ if (!cb.closest('.hidden-by-search')) cb.checked = state; }});
+  updateSelection();
+}});
+
+selClear.addEventListener('click', () => {{
+  getCheckboxes().forEach(cb => cb.checked = false);
+  selectAll.checked = false;
+  updateSelection();
+}});
+
+selDownload.addEventListener('click', async () => {{
+  const paths = Array.from(document.querySelectorAll('.sel-cb:checked')).map(cb => cb.dataset.path);
+  if (!paths.length) return;
+  selDownload.disabled = true;
+  selDownload.textContent = 'Zipping...';
+  try {{
+    const r = await fetch('{download_target}', {{
+      method: 'POST',
+      headers: {{'Content-Type': 'application/json'}},
+      body: JSON.stringify({{files:paths}})
+    }});
+    if (!r.ok) {{ alert('Download failed: ' + await r.text()); return; }}
+    const blob = await r.blob();
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = 'leak-download.zip';
+    a.click();
+    URL.revokeObjectURL(a.href);
+  }} catch(e) {{ alert('Download error: ' + e.message); }}
+  finally {{ selDownload.disabled = false; selDownload.textContent = 'Download'; }}
 }});
 
 // Upload
@@ -549,6 +665,43 @@ fn build_breadcrumbs(uri_path: &str) -> String {
         else { r.push_str(&format!(r#"<a href="{href}">{}</a>"#, html_escape(part))); }
     }
     r
+}
+
+// ── ZIP building ──────────────────────────────────────────────────────
+
+fn add_path_to_zip(
+    zip: &mut zip::ZipWriter<std::io::Cursor<Vec<u8>>>,
+    fs_path: &Path,
+    archive_name: &str,
+    root: &Path,
+    opts: SimpleFileOptions,
+) -> std::io::Result<()> {
+    if fs_path.is_file() {
+        zip.start_file(archive_name, opts)?;
+        let data = std::fs::read(fs_path)?;
+        std::io::Write::write_all(zip, &data)?;
+    } else if fs_path.is_dir() {
+        let mut stack: Vec<(PathBuf, String)> = vec![(fs_path.to_path_buf(), archive_name.to_string())];
+        while let Some((dir, prefix)) = stack.pop() {
+            if let Ok(rd) = std::fs::read_dir(&dir) {
+                for entry in rd.flatten() {
+                    let path = entry.path();
+                    if !path.starts_with(root) { continue; }
+                    let name = entry.file_name().to_string_lossy().to_string();
+                    if name.starts_with('.') { continue; }
+                    let arc_name = if prefix.is_empty() { name.clone() } else { format!("{prefix}/{name}") };
+                    if path.is_file() {
+                        zip.start_file(&arc_name, opts)?;
+                        let data = std::fs::read(&path)?;
+                        std::io::Write::write_all(zip, &data)?;
+                    } else if path.is_dir() {
+                        stack.push((path, arc_name));
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 // ── Multipart parsing ─────────────────────────────────────────────────
@@ -707,6 +860,63 @@ async fn serve(cfg: Arc<ServerConfig>, req: Request<Incoming>) -> Result<Respons
         return Ok(http_response(StatusCode::OK, "OK", "text/plain"));
     }
 
+    // Download handler (multi-file ZIP)
+    if method == Method::POST && uri_path.ends_with("/__download") {
+        let body_bytes = match req.collect().await {
+            Ok(c) => c.to_bytes(),
+            Err(_) => return Ok(http_response(StatusCode::BAD_REQUEST, "Read failed", "text/plain")),
+        };
+        let body_str = String::from_utf8_lossy(&body_bytes);
+        let paths = extract_json_string_array(&body_str, "files");
+        if paths.is_empty() {
+            return Ok(http_response(StatusCode::BAD_REQUEST, "No files specified", "text/plain"));
+        }
+
+        let root_clone = root.clone();
+        let zip_result = tokio::task::spawn_blocking(move || {
+            let buf = std::io::Cursor::new(Vec::new());
+            let mut zip = zip::ZipWriter::new(buf);
+            let opts = SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Deflated);
+
+            for path_str in &paths {
+                let clean = path_str.trim_start_matches('/');
+                let decoded = percent_decode(clean);
+                let fs_path = root_clone.join(&decoded);
+                let canonical = match fs_path.canonicalize() {
+                    Ok(c) if c.starts_with(&root_clone) => c,
+                    _ if decoded.is_empty() => continue,
+                    _ => continue,
+                };
+                // Use the last path component as the archive entry name
+                let arc_name = canonical.file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_else(|| decoded.clone());
+                let _ = add_path_to_zip(&mut zip, &canonical, &arc_name, &root_clone, opts);
+            }
+
+            zip.finish().map(|c| c.into_inner())
+        }).await;
+
+        match zip_result {
+            Ok(Ok(data)) => {
+                let size = data.len();
+                eprintln!(
+                    "  {} {GR}{B}DOWNLOAD{RST} {CY}ZIP{RST} {D}({}){RST}",
+                    ts(), format_size(size as u64),
+                );
+                return Ok(Response::builder()
+                    .status(StatusCode::OK)
+                    .header("Content-Type", "application/zip")
+                    .header("Content-Disposition", "attachment; filename=\"leak-download.zip\"")
+                    .header("Access-Control-Allow-Origin", "*")
+                    .body(Full::new(Bytes::from(data)))
+                    .unwrap());
+            }
+            _ => return Ok(http_response(StatusCode::INTERNAL_SERVER_ERROR, "ZIP creation failed", "text/plain")),
+        }
+    }
+
     // GET handler
     let clean = uri_path.trim_start_matches('/');
     let decoded = percent_decode(clean);
@@ -848,7 +1058,7 @@ fn parse_args() -> Args {
 
     if raw.iter().any(|a| a == "--help" || a == "-h") || raw.is_empty() {
         eprintln!();
-        eprintln!("  {B}{CY}leak{RST} {D}v0.4.0{RST}  {D}file server with uploads, tunnels, and TLS{RST}");
+        eprintln!("  {B}{CY}leak{RST} {D}v0.5.0{RST}  {D}file server with uploads, tunnels, and TLS{RST}");
         eprintln!();
         eprintln!("  {B}Usage:{RST}  leak {GR}<port>{RST} {D}[directory]{RST} {YL}[options]{RST}");
         eprintln!();
@@ -939,7 +1149,7 @@ async fn main() {
 
     // Banner
     eprintln!();
-    eprintln!("  {B}{CY}leak{RST} {D}v0.4.0{RST}");
+    eprintln!("  {B}{CY}leak{RST} {D}v0.5.0{RST}");
     eprintln!();
 
     let local_url = format!("{scheme}://127.0.0.1:{}", args.port);

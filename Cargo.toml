@@ -1,6 +1,6 @@
 [package]
 name = "leakd"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2021"
 description = "Fast file server with uploads, tunnels, and TLS"
 license = "MIT"
@@ -24,3 +24,4 @@ rustls = "0.23"
 rustls-pemfile = "2"
 rcgen = "0.13"
 qrcode = "0.14"
+zip = { version = "2", default-features = false, features = ["deflate"] }
